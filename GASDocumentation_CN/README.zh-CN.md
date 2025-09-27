@@ -269,3 +269,332 @@ GAS 当前存在的问题：
 1. 在编辑器中启用 GameplayAbilitySystem 插件
 1. 编辑 `YourProjectName.Build.cs`，将 `"GameplayAbilities", "GameplayTags", "GameplayTasks"` 添加到您的 `PrivateDependencyModuleNames`
 1. 刷新/重新生成您的 Visual Studio 项目文件
+1. 从 4.24 到 5.2，必须调用 `UAbilitySystemGlobals::Get().InitGlobalData()` 来使用 [`TargetData`](#concepts-targeting-data)。示例项目在 `UAssetManager::StartInitialLoading()` 中执行此操作。从 5.3 开始会自动调用。有关更多信息，请参阅 [`InitGlobalData()`](#concepts-asg-initglobaldata)。
+
+这就是启用 GAS 所需要做的一切。从这里开始，将 [`ASC`](#concepts-asc) 和 [`AttributeSet`](#concepts-as) 添加到您的 `Character` 或 `PlayerState`，并开始制作 [`GameplayAbilities`](#concepts-ga) 和 [`GameplayEffects`](#concepts-ge)！
+
+**[⬆ 返回顶部](#table-of-contents)**
+
+<a name="concepts"></a>
+## 4. GAS 概念
+
+#### 章节
+
+> 4.1 [Ability System Component](#concepts-asc)  
+> 4.2 [Gameplay Tags](#concepts-gt)  
+> 4.3 [Attributes](#concepts-a)  
+> 4.4 [Attribute Set](#concepts-as)  
+> 4.5 [Gameplay Effects](#concepts-ge)  
+> 4.6 [Gameplay Abilities](#concepts-ga)  
+> 4.7 [Ability Tasks](#concepts-at)  
+> 4.8 [Gameplay Cues](#concepts-gc)  
+> 4.9 [Ability System Globals](#concepts-asg)  
+> 4.10 [Prediction](#concepts-p)
+
+<a name="concepts-asc"></a>
+### 4.1 Ability System Component
+`AbilitySystemComponent` (`ASC`) 是 GAS 的核心。它是一个 `UActorComponent`（[`UAbilitySystemComponent`](https://docs.unrealengine.com/en-US/API/Plugins/GameplayAbilities/UAbilitySystemComponent/index.html)），处理与系统的所有交互。任何希望使用 [`GameplayAbilities`](#concepts-ga)、拥有 [`Attributes`](#concepts-a) 或接收 [`GameplayEffects`](#concepts-ge) 的 `Actor` 都必须附加一个 `ASC`。这些对象都存在于 `ASC` 内部，并由 `ASC` 管理和复制（除了 `Attributes`，它们由它们的 [`AttributeSet`](#concepts-as) 复制）。开发者可以但不是必须子类化此组件。
+
+附加了 `ASC` 的 `Actor` 被称为 `ASC` 的 `OwnerActor`。`ASC` 的物理表示 `Actor` 被称为 `AvatarActor`。`OwnerActor` 和 `AvatarActor` 可以是同一个 `Actor`，如 MOBA 游戏中的简单 AI 小兵。它们也可以是不同的 `Actor`，如 MOBA 游戏中玩家控制的英雄，其中 `OwnerActor` 是 `PlayerState`，`AvatarActor` 是英雄的 `Character` 类。大多数 `Actor` 会将 `ASC` 放在自身上。如果您的 `Actor` 会重生并需要在重生之间保持 `Attributes` 或 `GameplayEffects` 的持久性（如 MOBA 中的英雄），那么 `ASC` 的理想位置是在 `PlayerState` 上。
+
+**注意：**如果您的 `ASC` 在您的 `PlayerState` 上，那么您需要增加 `PlayerState` 的 `NetUpdateFrequency`。它在 `PlayerState` 上默认为一个很低的值，可能会导致延迟或在客户端上感知到的 `Attributes` 和 `GameplayTags` 等内容的变化滞后。确保启用 [`Adaptive Network Update Frequency`](https://docs.unrealengine.com/en-US/Gameplay/Networking/Actors/Properties/index.html#adaptivenetworkupdatefrequency)，Fortnite 使用它。
+
+`OwnerActor` 和 `AvatarActor`（如果是不同的 `Actor`）都应该实现 `IAbilitySystemInterface`。这个接口有一个必须重写的函数，`UAbilitySystemComponent* GetAbilitySystemComponent() const`，它返回指向其 `ASC` 的指针。`ASC` 在系统内部通过查找此接口函数来相互交互。
+
+`ASC` 在 `FActiveGameplayEffectsContainer ActiveGameplayEffects` 中保存其当前活动的 `GameplayEffects`。
+
+`ASC` 在 `FGameplayAbilitySpecContainer ActivatableAbilities` 中保存其授予的 `Gameplay Abilities`。任何时候您计划遍历 `ActivatableAbilities.Items`，确保在循环上方添加 `ABILITYLIST_SCOPE_LOCK();` 以锁定列表防止更改（由于移除能力）。作用域内的每个 `ABILITYLIST_SCOPE_LOCK();` 都会增加 `AbilityScopeLockCount`，然后在超出作用域时减少。不要尝试在 `ABILITYLIST_SCOPE_LOCK();` 的作用域内移除能力（清除能力函数在内部检查 `AbilityScopeLockCount` 以防止在列表被锁定时移除能力）。
+
+<a name="concepts-asc-rm"></a>
+### 4.1.1 Replication Mode
+`ASC` 为复制 `GameplayEffects`、`GameplayTags` 和 `GameplayCues` 定义了三种不同的复制模式 - `Full`、`Mixed` 和 `Minimal`。`Attributes` 由它们的 `AttributeSet` 复制。
+
+| Replication Mode   | 何时使用                                | 描述                                                                                                                    |
+| ------------------ | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `Full`             | 单人游戏                           | 每个 `GameplayEffect` 都复制到每个客户端。                                                                          |
+| `Mixed`            | 多人游戏，玩家控制的 `Actors` | `GameplayEffects` 只复制到拥有的客户端。只有 `GameplayTags` 和 `GameplayCues` 复制到所有人。 |
+| `Minimal`          | 多人游戏，AI 控制的 `Actors`     | `GameplayEffects` 从不复制到任何人。只有 `GameplayTags` 和 `GameplayCues` 复制到所有人。           |
+
+**注意：**`Mixed` 复制模式期望 `OwnerActor` 的 `Owner` 是 `Controller`。`PlayerState` 的 `Owner` 默认是 `Controller`，但 `Character` 的不是。如果使用 `Mixed` 复制模式且 `OwnerActor` 不是 `PlayerState`，那么您需要在 `OwnerActor` 上使用有效的 `Controller` 调用 `SetOwner()`。
+
+从 4.24 开始，`PossessedBy()` 现在将 `Pawn` 的所有者设置为新的 `Controller`。
+
+**[⬆ 返回顶部](#table-of-contents)**
+
+<a name="concepts-asc-setup"></a>
+### 4.1.2 设置和初始化
+`ASC` 通常在 `OwnerActor` 的构造函数中构造，并显式标记为复制。**这必须在 C++ 中完成**。
+
+```c++
+AGDPlayerState::AGDPlayerState()
+{
+	// Create ability system component, and set it to be explicitly replicated
+	AbilitySystemComponent = CreateDefaultSubobject<UGDAbilitySystemComponent>(TEXT("AbilitySystemComponent"));
+	AbilitySystemComponent->SetIsReplicated(true);
+	//...
+}
+```
+
+`ASC` 需要在服务器和客户端上使用其 `OwnerActor` 和 `AvatarActor` 进行初始化。您希望在 `Pawn` 的 `Controller` 已设置后（拥有后）进行初始化。单人游戏只需要关心服务器路径。
+
+对于 `ASC` 位于 `Pawn` 上的玩家控制角色，我通常在服务器上的 `Pawn` 的 `PossessedBy()` 函数中初始化，在客户端上的 `PlayerController` 的 `AcknowledgePossession()` 函数中初始化。
+
+```c++
+void APACharacterBase::PossessedBy(AController * NewController)
+{
+	Super::PossessedBy(NewController);
+
+	if (AbilitySystemComponent)
+	{
+		AbilitySystemComponent->InitAbilityActorInfo(this, this);
+	}
+
+	// ASC MixedMode replication requires that the ASC Owner's Owner be the Controller.
+	SetOwner(NewController);
+}
+```
+
+```c++
+void APAPlayerControllerBase::AcknowledgePossession(APawn* P)
+{
+	Super::AcknowledgePossession(P);
+
+	APACharacterBase* CharacterBase = Cast<APACharacterBase>(P);
+	if (CharacterBase)
+	{
+		CharacterBase->GetAbilitySystemComponent()->InitAbilityActorInfo(CharacterBase, CharacterBase);
+	}
+
+	//...
+}
+```
+
+对于 `ASC` 位于 `PlayerState` 上的玩家控制角色，我通常在服务器上的 `Pawn` 的 `PossessedBy()` 函数中初始化，在客户端上的 `Pawn` 的 `OnRep_PlayerState()` 函数中初始化。这确保了 `PlayerState` 在客户端存在。
+
+```c++
+// Server only
+void AGDHeroCharacter::PossessedBy(AController * NewController)
+{
+	Super::PossessedBy(NewController);
+
+	AGDPlayerState* PS = GetPlayerState<AGDPlayerState>();
+	if (PS)
+	{
+		// Set the ASC on the Server. Clients do this in OnRep_PlayerState()
+		AbilitySystemComponent = Cast<UGDAbilitySystemComponent>(PS->GetAbilitySystemComponent());
+
+		// AI won't have PlayerControllers so we can init again here just to be sure. No harm in initing twice for heroes that have PlayerControllers.
+		PS->GetAbilitySystemComponent()->InitAbilityActorInfo(PS, this);
+	}
+	
+	//...
+}
+```
+
+```c++
+// Client only
+void AGDHeroCharacter::OnRep_PlayerState()
+{
+	Super::OnRep_PlayerState();
+
+	AGDPlayerState* PS = GetPlayerState<AGDPlayerState>();
+	if (PS)
+	{
+		// Set the ASC for clients. Server does this in PossessedBy.
+		AbilitySystemComponent = Cast<UGDAbilitySystemComponent>(PS->GetAbilitySystemComponent());
+
+		// Init ASC Actor Info for clients. Server will init its ASC when it possesses a new Actor.
+		AbilitySystemComponent->InitAbilityActorInfo(PS, this);
+	}
+
+	// ...
+}
+```
+
+如果您收到错误消息 `LogAbilitySystem: Warning: Can't activate LocalOnly or LocalPredicted ability %s when not local!`，那么您没有在客户端初始化您的 `ASC`。
+
+**[⬆ 返回顶部](#table-of-contents)**
+
+<a name="concepts-gt"></a>
+### 4.2 Gameplay Tags
+[`FGameplayTags`](https://docs.unrealengine.com/en-US/API/Runtime/GameplayTags/FGameplayTag/index.html) 是形式为 `Parent.Child.Grandchild...` 的分层名称，注册到 `GameplayTagManager`。这些标签对于分类和描述对象状态非常有用。例如，如果角色被眩晕，我们可以在眩晕持续期间给它一个 `State.Debuff.Stun` `GameplayTag`。
+
+您会发现自己用 `GameplayTags` 替换过去用布尔值或枚举处理的东西，并对对象是否具有某些 `GameplayTags` 进行布尔逻辑判断。
+
+当给对象添加标签时，如果它有 `ASC`，我们通常将它们添加到其 `ASC`，以便 GAS 可以与它们交互。`UAbilitySystemComponent` 实现了 `IGameplayTagAssetInterface`，提供访问其拥有的 `GameplayTags` 的函数。
+
+多个 `GameplayTags` 可以存储在 `FGameplayTagContainer` 中。最好使用 `GameplayTagContainer` 而不是 `TArray<FGameplayTag>`，因为 `GameplayTagContainers` 添加了一些效率魔法。虽然标签是标准的 `FNames`，但如果在项目设置中启用了 `Fast Replication`，它们可以在 `FGameplayTagContainers` 中高效地打包在一起进行复制。`Fast Replication` 要求服务器和客户端具有相同的 `GameplayTags` 列表。这通常不应该是问题，所以您应该启用此选项。`GameplayTagContainers` 也可以返回 `TArray<FGameplayTag>` 用于迭代。
+
+存储在 `FGameplayTagCountContainer` 中的 `GameplayTags` 有一个 `TagMap`，存储该 `GameplayTag` 的实例数量。`FGameplayTagCountContainer` 可能仍然包含 `GameplayTag`，但其 `TagMapCount` 为零。如果 `ASC` 仍然有 `GameplayTag`，您在调试时可能会遇到这种情况。任何 `HasTag()` 或 `HasMatchingTag()` 或类似函数都会检查 `TagMapCount`，如果 `GameplayTag` 不存在或其 `TagMapCount` 为零，则返回 false。
+
+`GameplayTags` 必须提前在 `DefaultGameplayTags.ini` 中定义。Unreal Engine 编辑器在项目设置中提供一个界面，让开发者管理 `GameplayTags` 而无需手动编辑 `DefaultGameplayTags.ini`。`GameplayTag` 编辑器可以创建、重命名、搜索引用和删除 `GameplayTags`。
+
+![项目设置中的 GameplayTag 编辑器](https://github.com/tranek/GASDocumentation/raw/master/Images/gameplaytageditor.png)
+
+搜索 `GameplayTag` 引用将在编辑器中显示熟悉的 `Reference Viewer` 图表，显示引用该 `GameplayTag` 的所有资产。但是，这不会显示引用该 `GameplayTag` 的任何 C++ 类。
+
+重命名 `GameplayTags` 会创建重定向，以便仍然引用原始 `GameplayTag` 的资产可以重定向到新的 `GameplayTag`。如果可能，我更喜欢创建一个新的 `GameplayTag`，手动将所有引用更新到新的 `GameplayTag`，然后删除旧的 `GameplayTag` 以避免创建重定向。
+
+除了 `Fast Replication` 外，`GameplayTag` 编辑器还有一个选项来填充常见复制的 `GameplayTags` 以进一步优化它们。
+
+如果 `GameplayTags` 是从 `GameplayEffect` 添加的，它们会被复制。`ASC` 允许您添加不被复制且必须手动管理的 `LooseGameplayTags`。示例项目为 `State.Dead` 使用 `LooseGameplayTag`，以便拥有的客户端可以立即响应其生命值降到零的情况。重生时手动将 `TagMapCount` 设置回零。只有在使用 `LooseGameplayTags` 时才手动调整 `TagMapCount`。最好使用 `UAbilitySystemComponent::AddLooseGameplayTag()` 和 `UAbilitySystemComponent::RemoveLooseGameplayTag()` 函数，而不是手动调整 `TagMapCount`。
+
+在 C++ 中获取 `GameplayTag` 的引用：
+```c++
+FGameplayTag::RequestGameplayTag(FName("Your.GameplayTag.Name"))
+```
+
+对于高级 `GameplayTag` 操作，如获取父级或子级 `GameplayTags`，请查看 `GameplayTagManager` 提供的函数。要访问 `GameplayTagManager`，包含 `GameplayTagManager.h` 并使用 `UGameplayTagManager::Get().FunctionName` 调用它。`GameplayTagManager` 实际上将 `GameplayTags` 存储为关系节点（父、子等），以便比持续的字符串操作和比较更快地处理。
+
+`GameplayTags` 和 `GameplayTagContainers` 可以有可选的 `UPROPERTY` 说明符 `Meta = (Categories = "GameplayCue")`，它在 Blueprint 中过滤标签，只显示具有 `GameplayCue` 父标签的 `GameplayTags`。当您知道 `GameplayTag` 或 `GameplayTagContainer` 变量应该只用于 `GameplayCues` 时，这很有用。
+
+或者，有一个名为 `FGameplayCueTag` 的单独结构，它封装了一个 `FGameplayTag`，并且还会自动在 Blueprint 中过滤 `GameplayTags`，只显示具有 `GameplayCue` 父标签的标签。
+
+示例项目广泛使用 `GameplayTags`。
+
+**[⬆ 返回顶部](#table-of-contents)**
+
+<a name="concepts-gt-change"></a>
+#### 4.2.1 响应 Gameplay Tags 的变化
+`ASC` 提供委托来监听添加或移除 `GameplayTag` 时的响应。
+
+```c++
+AbilitySystemComponent->RegisterGameplayTagEvent(FGameplayTag::RequestGameplayTag(FName("State.Debuff.Stun")), EGameplayTagEventType::NewOrRemoved).AddUObject(this, &AGDPlayerState::StunTagChanged);
+```
+
+回调函数有一个参数 `FGameplayTag` 和一个 `int32`，分别表示触发回调的 `GameplayTag` 和该 `GameplayTag` 的新计数。
+
+```c++
+virtual void StunTagChanged(const FGameplayTag CallbackTag, int32 NewCount);
+```
+
+**[⬆ 返回顶部](#table-of-contents)**
+
+<a name="concepts-a"></a>
+### 4.3 Attributes
+`Attributes` 是由 `float` 类型和可选数据表行定义的浮点值（用于创建曲线）。它们可以表示从角色生命值到角色等级再到一瓶药水的数量的任何内容。如果某个东西是游戏中的数值，您应该考虑使用 `Attribute`。`Attributes` 通常应该只由 [`GameplayEffects`](#concepts-ge) 修改，以便 `ASC` 可以[预测](#concepts-p)更改。
+
+`Attributes` 由 [`AttributeSet`](#concepts-as) 定义和保存。`AttributeSet` 负责复制被标记为复制的 `Attributes`。有关如何定义 `Attributes` 的信息，请参阅 `AttributeSet` 部分。
+
+**提示：**如果您不想硬编码 `Attributes` 的最大值，则有一种方法可以通过无限持续时间的 `GameplayEffect` 设置基础值来最大值变为当前值的方法。
+
+**[⬆ 返回顶部](#table-of-contents)**
+
+<a name="acronyms"></a>
+## 10. GAS 常见缩写
+
+| 名称                                                                                                   | 缩写            |
+|------------------------------------------------------------------------------------------------------- | ------------------- |
+| AbilitySystemComponent                                                                                 | ASC                 |
+| AbilityTask                                                                                            | AT                  |
+| [Epic 的 Action RPG 示例项目](https://www.unrealengine.com/marketplace/en-US/product/action-rpg) | ARPG, ARPG Sample   |
+| CharacterMovementComponent                                                                             | CMC                 |
+| GameplayAbility                                                                                        | GA                  |
+| GameplayAbilitySystem                                                                                  | GAS                 |
+| GameplayCue                                                                                            | GC                  |
+| GameplayEffect                                                                                         | GE                  |
+| GameplayEffectExecutionCalculation                                                                     | ExecCalc, Execution |
+| GameplayTag                                                                                            | Tag, GT             |
+| ModifierMagnitudeCalculation                                                                           | ModMagCalc, MMC     |
+
+**[⬆ 返回顶部](#table-of-contents)**
+
+<a name="resources"></a>
+## 11. 其他资源
+* [官方文档](https://docs.unrealengine.com/en-US/Gameplay/GameplayAbilitySystem/index.html)
+* 源代码！
+   * 特别是 `GameplayPrediction.h`
+* [Epic 的 Lyra 示例项目](https://unrealengine.com/marketplace/en-US/learn/lyra)
+* [Epic 的 Action RPG 示例项目](https://www.unrealengine.com/marketplace/en-US/product/action-rpg)
+* [Unreal Slackers Discord](https://unrealslackers.org/) 有一个专门用于 GAS 的文本频道 `#gameplay-ability-system`
+   * 检查置顶消息
+* [Dan 'Pan' 的资源 GitHub 存储库](https://github.com/Pantong51/GASContent)
+* [SabreDartStudios 的 YouTube 视频](https://www.youtube.com/channel/UCCFUhQ6xQyjXDZ_d6X_H_-A)
+
+<a name="resources-daveratti"></a>
+### 11.1 与 Epic Games 的 Dave Ratti 的问答
+
+<a name="resources-daveratti-community1"></a>
+#### 11.1.1 社区问题 1
+[Dave Ratti 对 Unreal Slackers Discord 服务器社区关于 GAS 问题的回应](https://epicgames.ent.box.com/s/m1egifkxv3he3u3xezb9hzbgroxyhx89)。
+
+**[⬆ 返回顶部](#table-of-contents)**
+
+<a name="resources-daveratti-community2"></a>
+#### 11.1.2 社区问题 2
+社区成员 [iniside](https://github.com/iniside) 与 Dave Ratti 的问答。
+
+**[⬆ 返回顶部](#table-of-contents)**
+
+<a name="changelog"></a>
+## 12. GAS 更改日志
+
+这是从官方 Unreal Engine 升级更改日志和我遇到的未记录更改中编译的 GAS 重要更改（修复、更改和新功能）列表。如果您发现此处未列出的内容，请提出问题或拉取请求。
+
+<a name="changelog-5.3"></a>
+### 5.3
+* 崩溃修复：修复了在无缝传输后尝试应用 Gameplay Cues 时的崩溃。
+* 崩溃修复：修复了使用 Live Coding 时 GlobalAbilityTaskCount 导致的崩溃。
+* 错误修复：子类中调用 `Super::ActivateAbility` 现在是安全的。以前，它会调用 `CommitAbility`。
+* 错误修复：添加了对正确复制不同类型 FGameplayEffectContext 的支持。
+* 新功能：确保在 Ability System 使用时调用 UAbilitySystemGlobals::InitGlobalData。以前如果用户没有调用它，Gameplay Ability System 无法正常工作。
+
+https://docs.unrealengine.com/5.3/en-US/unreal-engine-5.3-release-notes/
+
+<a name="changelog-5.2"></a>
+### 5.2
+* 错误修复：修复了 `UAbilitySystemBlueprintLibrary::MakeSpecHandle` 函数中的崩溃。
+* 新功能：[Gameplay Targeting System](https://docs.unrealengine.com/en-US/gameplay-targeting-system-in-unreal-engine/) 是一种创建数据驱动目标请求的方法。
+* 新功能：添加了对 GameplayTag 查询的自定义序列化支持。
+
+https://docs.unrealengine.com/5.2/en-US/unreal-engine-5.2-release-notes/
+
+<a name="changelog-5.1"></a>
+### 5.1
+* 错误修复：修复了复制的松散 gameplay tags 没有复制到所有者的问题。
+* 新功能：添加了对 Gameplay Effects 添加阻止能力标签的支持。
+* 新功能：添加了 WaitGameplayTagQuery 节点。
+
+https://docs.unrealengine.com/5.1/en-US/unreal-engine-5.1-release-notes/
+
+<a name="changelog-5.0"></a>
+### 5.0
+
+https://docs.unrealengine.com/5.0/en-US/unreal-engine-5.0-release-notes/
+
+<a name="changelog-4.27"></a>
+### 4.27
+* 崩溃修复：修复了网络客户端在 Actor 完成执行使用具有强度随时间修饰符的恒定力根运动任务的能力时可能崩溃的根运动源问题。
+* 新功能：原生 GameplayTags。引入了新的 `FNativeGameplayTag`，这些使得在模块加载和卸载时正确注册和取消注册的一次性原生标签成为可能。
+
+https://docs.unrealengine.com/en-US/WhatsNew/Builds/ReleaseNotes/4_27/
+
+<a name="changelog-4.26"></a>
+### 4.26
+* GAS 插件不再标记为测试版。
+* 崩溃修复：修复了添加没有有效标签源选择的 gameplay tag 时的崩溃。
+* 新功能：为 gameplay ability commit 函数添加了可选标签参数。
+
+https://docs.unrealengine.com/en-US/WhatsNew/Builds/ReleaseNotes/4_26/
+
+<a name="changelog-4.25.1"></a>
+### 4.25.1
+* 修复！UE-92787 使用 Get Float Attribute 节点且属性引脚设置为内联时保存蓝图的崩溃
+* 修复！UE-92810 生成具有实例可编辑 gameplay tag 属性且已内联更改的 actor 时的崩溃
+
+<a name="changelog-4.25"></a>
+### 4.25
+* 修复了 `RootMotionSource` `AbilityTasks` 的预测
+* [`GAMEPLAYATTRIBUTE_REPNOTIFY()`](#concepts-as-attributes) 现在还额外接受旧的 `Attribute` 值。我们必须将其作为可选参数提供给我们的 `OnRep` 函数。
+* 为 `UGameplayAbility` 添加了 [`NetSecurityPolicy`](#concepts-ga-netsecuritypolicy)。
+
+https://docs.unrealengine.com/en-US/WhatsNew/Builds/ReleaseNotes/4_25/
+
+<a name="changelog-4.24"></a>
+### 4.24
+* 修复了蓝图节点 `Attribute` 变量在编译时重置为 `None` 的问题。
+* 需要调用 [`UAbilitySystemGlobals::InitGlobalData()`](#concepts-asg-initglobaldata) 来使用 [`TargetData`](#concepts-targeting-data)，否则您会收到 `ScriptStructCache` 错误，客户端将与服务器断开连接。我的建议是现在在每个项目中都调用这个，而在 4.24 之前这是可选的。
+
+https://docs.unrealengine.com/en-US/WhatsNew/Builds/ReleaseNotes/4_24/
+
+**[⬆ 返回顶部](#table-of-contents)**
