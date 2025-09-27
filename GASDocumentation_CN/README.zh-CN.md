@@ -450,8 +450,6 @@ FGameplayTag::RequestGameplayTag(FName("Your.GameplayTag.Name"))
 
 或者，有一个名为 `FGameplayCueTag` 的单独结构，它封装了一个 `FGameplayTag`，并且还会自动在 Blueprint 中过滤 `GameplayTags`，只显示具有 `GameplayCue` 父标签的标签。
 
-示例项目广泛使用 `GameplayTags`。
-
 **[⬆ 返回顶部](#table-of-contents)**
 
 <a name="concepts-gt-change"></a>
@@ -477,6 +475,106 @@ virtual void StunTagChanged(const FGameplayTag CallbackTag, int32 NewCount);
 `Attributes` 由 [`AttributeSet`](#concepts-as) 定义和保存。`AttributeSet` 负责复制被标记为复制的 `Attributes`。有关如何定义 `Attributes` 的信息，请参阅 `AttributeSet` 部分。
 
 **提示：**如果您不想硬编码 `Attributes` 的最大值，则有一种方法可以通过无限持续时间的 `GameplayEffect` 设置基础值来最大值变为当前值的方法。
+
+**[⬆ 返回顶部](#table-of-contents)**
+
+<a name="cae"></a>
+## 5. 常见实现的能力和效果
+
+<a name="cae-stun"></a>
+### 5.1 眩晕
+通常对于眩晕，我们希望取消 `Character` 的所有活动 `GameplayAbilities`，防止新的 `GameplayAbility` 激活，并在眩晕持续期间防止移动。示例项目的 Meteor `GameplayAbility` 对命中目标应用眩晕。
+
+要取消目标的活动 `GameplayAbilities`，我们在添加眩晕 [`GameplayTag` 时](#concepts-gt-change)调用 `AbilitySystemComponent->CancelAbilities()`。
+
+要防止在眩晕时激活新的 `GameplayAbilities`，在它们的 [`Activation Blocked Tags` `GameplayTagContainer`](#concepts-ga-tags) 中给 `GameplayAbilities` 添加眩晕 `GameplayTag`。
+
+要防止在眩晕时移动，我们重写 `CharacterMovementComponent` 的 `GetMaxSpeed()` 函数，当所有者有眩晕 `GameplayTag` 时返回 0。
+
+**[⬆ 返回顶部](#table-of-contents)**
+
+<a name="cae-sprint"></a>
+### 5.2 冲刺
+示例项目提供了如何冲刺的示例 - 按住 `Left Shift` 时跑得更快。
+
+更快的移动由 `CharacterMovementComponent` 通过向服务器发送标志来预测性地处理。有关详细信息，请参阅 `GDCharacterMovementComponent.h/cpp`。
+
+`GA` 处理对 `Left Shift` 输入的响应，告诉 `CMC` 开始和停止冲刺，并在按下 `Left Shift` 时预测性地消耗体力。有关详细信息，请参阅 `GA_Sprint_BP`。
+
+**[⬆ 返回顶部](#table-of-contents)**
+
+<a name="cae-ads"></a>
+### 5.3 瞄准下蹲
+示例项目处理这个的方式与冲刺完全相同，但是减少移动速度而不是增加它。
+
+有关预测性减少移动速度的详细信息，请参阅 `GDCharacterMovementComponent.h/cpp`。
+
+有关处理输入的详细信息，请参阅 `GA_AimDownSight_BP`。瞄准下蹲没有体力消耗。
+
+**[⬆ 返回顶部](#table-of-contents)**
+
+<a name="cae-ls"></a>
+### 5.4 吸血
+我在伤害 [`ExecutionCalculation`](#concepts-ge-ec) 内部处理吸血。`GameplayEffect` 会有一个像 `Effect.CanLifesteal` 的 `GameplayTag`。`ExecutionCalculation` 检查 `GameplayEffectSpec` 是否有该 `Effect.CanLifesteal` `GameplayTag`。如果 `GameplayTag` 存在，`ExecutionCalculation` [创建一个动态 `Instant` `GameplayEffect`](#concepts-ge-dynamic)，以给予的生命值数量作为修饰符，并将其应用回 `Source` 的 `ASC`。
+
+```c++
+if (SpecAssetTags.HasTag(FGameplayTag::RequestGameplayTag(FName("Effect.Damage.CanLifesteal"))))
+{
+	float Lifesteal = Damage * LifestealPercent;
+
+	UGameplayEffect* GELifesteal = NewObject<UGameplayEffect>(GetTransientPackage(), FName(TEXT("Lifesteal")));
+	GELifesteal->DurationPolicy = EGameplayEffectDurationType::Instant;
+
+	int32 Idx = GELifesteal->Modifiers.Num();
+	GELifesteal->Modifiers.SetNum(Idx + 1);
+	FGameplayModifierInfo& Info = GELifesteal->Modifiers[Idx];
+	Info.ModifierMagnitude = FScalableFloat(Lifesteal);
+	Info.ModifierOp = EGameplayModOp::Additive;
+	Info.Attribute = UPAAttributeSetBase::GetHealthAttribute();
+
+	SourceAbilitySystemComponent->ApplyGameplayEffectToSelf(GELifesteal, 1.0f, SourceAbilitySystemComponent->MakeEffectContext());
+}
+```
+
+**[⬆ 返回顶部](#table-of-contents)**
+
+<a name="cae-random"></a>
+### 5.5 在客户端和服务器上生成随机数
+有时您需要在 `GameplayAbility` 内部生成"随机"数字，用于子弹后坐力或散布等。客户端和服务器都希望生成相同的随机数。为此，我们必须在 `GameplayAbility` 激活时将 `random seed` 设置为相同。您需要每次激活 `GameplayAbility` 时设置 `random seed`，以防客户端错误预测激活并且其随机数序列与服务器不同步。
+
+| 随机种子设置方法                                                          | 描述                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ---------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 使用激活预测键                                            | `GameplayAbility` 激活预测键是一个 int16，保证在客户端和服务器的 `Activation()` 中同步和可用。您可以在客户端和服务器上将其设置为 `random seed`。这种方法的缺点是预测键总是在每次游戏开始时从零开始，并在生成键之间一致地递增值。这意味着每场比赛都会有完全相同的随机数序列。这对您的需求来说可能足够随机，也可能不够。 |
+| 在激活 `GameplayAbility` 时通过事件有效载荷发送种子 | 通过事件激活您的 `GameplayAbility`，并通过复制的事件有效载荷从客户端向服务器发送随机生成的种子。这允许更多的随机性，但客户端可以轻易地破解游戏，每次只发送相同的种子值。此外，通过事件激活 `GameplayAbilities` 将阻止它们从输入绑定激活。                                                                                                                                                                     |
+
+如果您的随机偏差很小，大多数玩家不会注意到每场游戏的序列都相同，使用激活预测键作为 `random seed` 应该适合您。如果您正在做更复杂的需要防黑客的事情，也许使用 `Server Initiated` `GameplayAbility` 会更好，服务器可以创建预测键或生成 `random seed` 通过事件有效载荷发送。
+
+**[⬆ 返回顶部](#table-of-contents)**
+
+<a name="debugging"></a>
+## 6. 调试 GAS
+
+<a name="debugging-sd"></a>
+### 6.1 showdebug abilitysystem
+类型化 `showdebug abilitysystem` 游戏内控制台命令。这将显示属于您的 `Character` 的 `ASC` 的 `GameplayTags`、`GameplayEffects`、和 `GameplayAbilities`。使用 `PageUp` 和 `PageDown` 键循环浏览 `GameplayEffects` 页面。
+
+**[⬆ 返回顶部](#table-of-contents)**
+
+<a name="debugging-gd"></a>
+### 6.2 Gameplay Debugger
+GAS 为 Gameplay Debugger 添加了功能。使用撇号（`'`）键访问 Gameplay Debugger，然后按数字键盘上的 3 选择 Abilities 类别。该类别可能需要在 Editor Preferences -> Gameplay Debugger 中启用。
+
+这个调试器显示所选 `Character` 的 `GameplayTags`、`GameplayEffects`、和 `GameplayAbilities`。不幸的是，您无法更改调试器显示的 `Character`，它总是显示您的 `Character`。
+
+**[⬆ 返回顶部](#table-of-contents)**
+
+<a name="debugging-log"></a>
+### 6.3 GAS 日志记录
+GAS 源代码中有许多日志记录语句。默认情况下，大多数都设置为 `Verbose` 日志级别。要启用日志类别，在您的控制台中添加以下行之一到您的 `DefaultEngine.ini` 或使用控制台命令：
+
+```
+log LogAbilitySystem VeryVerbose
+```
 
 **[⬆ 返回顶部](#table-of-contents)**
 
